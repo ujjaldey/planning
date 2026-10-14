@@ -996,6 +996,509 @@ Jira's rate limit, not CPU, is the real ceiling for single-tenant throughput. Sh
 
 ---
 
+## 25. Jira integration contract
+
+### 25.1 Reads
+
+| Call | Purpose | Caching |
+|---|---|---|
+| `GET /rest/api/3/issue/{key}?expand=changelog` | Snapshot source | ETag + `If-None-Match`, 60 s TTL |
+| `GET /rest/api/3/search/jql` (token pagination) | Release scope resolution | None; scoped per run |
+| `GET /rest/api/3/field` | Custom field discovery + type validation | 24 h |
+| `GET /rest/api/3/issue/createmeta/{project}/issuetypes/{id}` | Screen presence of score fields | 24 h |
+| `GET /rest/api/3/mypermissions?projectKey=…` | Edit permission precheck | 10 min |
+| `GET /rest/api/3/issue/{key}/comment` | Locate upsert marker on cold start | 5 min |
+
+Rules:
+- **Conditional requests first.** A `304 Not Modified` is a cache hit and costs no quota; on a 12k-event day this alone removes ~40% of reads.
+- **Never fetch attachments.** Only attachment metadata (count, type) is read; bodies are out of scope.
+- **Changelog is optional.** It is fetched only when loop-prevention or audit needs the last updater; score-only scans skip it.
+- **Pagination is cursor-based.** `nextPageToken`, page size 100, hard stop at 50k issues per run with a `SCOPE_TRUNCATED` flag so a runaway JQL cannot melt the site.
+
+### 25.2 Field discovery and validation
+
+At onboarding (and nightly), the service resolves the project's field map against live metadata:
+
+```
+for each mapped field:
+  exists?            -> else fail config with FIELD_NOT_FOUND
+  type compatible?   -> number/select/labels as declared
+  on create screen?  -> warn if not (backfill writes still allowed on edit screen)
+  app can edit?      -> else fail writes, keep evaluations
+```
+
+A field map that fails validation is **frozen**: evaluations continue, write-backs are disabled, and the owning team gets a ticket. Silent misconfiguration is how a scoring tool ends up writing "0" into a text field.
+
+### 25.3 ADF and text normalization
+
+Jira descriptions and acceptance criteria arrive as Atlassian Document Format. The snapshotter converts ADF to plain text with a deterministic walker:
+
+| ADF node | Rendering |
+|---|---|
+| `paragraph` | text + `\n\n` |
+| `bulletList` / `orderedList` | `- ` / `1. ` per item + `\n` |
+| `heading` | `## ` prefix (level preserved) |
+| `codeBlock` | fenced block, language preserved |
+| `table` | cells joined by ` | `, rows by `\n` |
+| `mention` | `@DisplayName` |
+| `mediaSingle` | `[attachment: filename]` (never inlined) |
+| `hardBreak` | `\n` |
+
+Conversion is **lossless for text** and stable: the same ADF always yields the same string, which is what makes the content hash and evidence offsets meaningful. Evidence quotes are matched against this normalized text, not against rendered HTML.
+
+### 25.4 Writes and conflicts
+
+```
+PUT /rest/api/3/issue/{key}
+{ "update": { "fields": { "customfield_10421": [{ "set": 64 }] } } }
+
+409 Conflict            -> re-fetch issue, recompute, retry once
+400 Field cannot be set -> freeze field map, alert owner
+403 No permission       -> mark writeback PERMISSION_DENIED, do not retry
+429                     -> honour Retry-After, requeue with jitter
+```
+
+### 25.5 Webhook verification
+
+- HMAC-SHA256 over the raw body using the per-tenant shared secret; constant-time comparison.
+- Optional IP allowlist for the Jira Cloud egress ranges.
+- Timestamp freshness window (10 min) to bound replay; older valid deliveries are accepted only if the dedupe table lacks the event.
+- Signature failure increments a security metric and returns `401` without body detail.
+
+---
+
+## 26. Consistency, ordering, and concurrency
+
+JRVS has three writers per issue (webhook path, release scan, manual request) and one external writer (humans). The model that keeps them coherent:
+
+1. **Single-writer per issue.** Temporal workflow ID is derived from `issue_key`; concurrent triggers attach to the running workflow instead of starting a second one. No out-of-order score writes, ever.
+2. **Snapshot is immutable.** Evaluation reads one snapshot row; it never re-reads Jira mid-flight.
+3. **Write is compare-and-set.** Before writing, the service compares the live `updated` timestamp with the snapshot's. Mismatch → abort write, schedule re-evaluation. A score computed from stale text is never published.
+4. **Outbox decouples persistence from publication.** The evaluation commits and the writeback row commits in the same transaction; a relay publishes afterwards. Crash between them loses nothing.
+5. **Release scans are scope-consistent.** The issue list is frozen at run start; issues created mid-run are reported in a `late_arrivals` block rather than silently altering the denominator.
+
+```mermaid
+sequenceDiagram
+    participant W1 as Webhook trigger
+    participant W2 as Release scan
+    participant WF as Issue workflow (single writer)
+    participant DB as Postgres
+    participant J as Jira
+
+    W1->>WF: start (dedupe key)
+    W2->>WF: signal include_in_release
+    WF->>DB: read snapshot
+    WF->>WF: evaluate + score
+    WF->>DB: commit evaluation + outbox (one TX)
+    WF->>J: compare-and-set write
+    alt live updated_at changed
+        J-->>WF: mismatch
+        WF->>WF: re-enqueue with fresh snapshot
+    else write ok
+        J-->>WF: 200
+        WF->>DB: mark written
+    end
+```
+
+**Failure semantics.** Writeback is at-least-once with value guarding, so a duplicate delivery is a no-op. The system prefers "no write" over "two writes": an issue showing yesterday's score for 30 seconds is acceptable; two bots fighting over a field is not.
+
+---
+
+## 27. Cross-issue validation
+
+Single-issue validation misses structural problems that only exist between tickets. Three cross-issue checks ship in v1 as a separate rule family (`kind: graph`), evaluated during release scans rather than per webhook:
+
+| Check | Rule | Severity | Notes |
+|---|---|---|---|
+| Epic outcome coverage | Every epic has an outcome and ≥ 1 child story with AC | major | Blocks epic-level gate |
+| Story–epic alignment | Child AC semantically supports the parent outcome | minor | Advisory; semantic, grounded |
+| Dependency cycles | `blocks` edges contain no cycle | blocker | Pure graph algorithm, no LLM |
+| Orphan work | Open story with no epic and no fix version | minor | Configurable per project |
+| Duplicate cluster | ≥ 2 open issues with embedding similarity ≥ 0.95 | minor | Advisory; never auto-closes |
+| Split candidates | Story points ≥ 21 and AC count ≥ 8 | minor | Suggests decomposition |
+
+**Cycle detection** runs in code (Tarjan SCC) over the issue-link graph; it is deterministic, cheap, and catches a genuinely dangerous state that no amount of ticket-text quality would reveal.
+
+**Duplicate clustering** uses project-scoped ANN over title+AC embeddings, refreshed nightly. Clusters are written as advisory links on the console; JRVS never closes or merges issues — that is a human decision with its own audit trail.
+
+Cross-issue findings attach to the *epic* or the *cluster*, not to whichever issue happened to be evaluated last, so deduplication is natural.
+
+---
+
+## 28. Explainability contract
+
+A score nobody can explain is a score nobody will use. Every published score must answer four questions without reading logs:
+
+1. **What contributed?** Per-rule contribution = `wᵢ·oᵢ / Σw`, ranked descending.
+2. **What capped it?** Explicit cap records (`BLOCKER_PRESENT`, `MAJOR_COUNT`, `LOW_COVERAGE`), not an unexplained jump.
+3. **What changed?** Top three movers versus the previous evaluation of the same issue, with the field that changed.
+4. **What is uncertain?** `unknown` rules with reasons (`MISSING_DATA`, `LLM_UNAVAILABLE`, `EVIDENCE_INVALID`, `TRUNCATED`).
+
+```json
+GET /v1/issues/ABC-123/why
+
+{
+  "score": 64, "grade": "NEEDS_WORK",
+  "caps_applied": [],
+  "contributions": [
+    { "rule": "SA-001", "weight": 3.0, "outcome": 1.0, "points": 21.3 },
+    { "rule": "SE-003", "weight": 2.5, "outcome": 0.5, "points": 8.9 },
+    { "rule": "SA-014", "weight": 2.0, "outcome": 0.0, "points": 0.0 }
+  ],
+  "unknowns": [
+    { "rule": "SE-011", "reason": "MISSING_DATA", "detail": "Bug template field absent" }
+  ],
+  "deltas_since_previous": [
+    { "rule": "SE-007", "from": 0.0, "to": 1.0, "points": +8.9 }
+  ],
+  "confidence": { "coverage": 0.82, "grounded_rate": 1.0, "final": 0.89 }
+}
+```
+
+Prose explanations are **template-generated from this structure**, never LLM-authored. A model that can invent a reason can invent a reason that is wrong, and this endpoint is the one users will quote in release reviews.
+
+---
+
+## 29. Configuration reference
+
+| Key | Scope | Default | Notes |
+|---|---|---|---|
+| `writes_enabled` | tenant/project | false | Kill switch; evaluations continue |
+| `shadow_mode` | project | true at onboarding | Stores findings, skips writes |
+| `semantic_enabled` | tenant | true | `false` → deterministic-only |
+| `coalesce_window_s` | tenant | 20 | Debounce per issue |
+| `max_concurrency_per_tenant` | tenant | 8 | Guards Jira quota |
+| `daily_token_budget` | tenant | 5M | Throttle at 80%, hard stop at 100% |
+| `per_issue_token_ceiling` | tenant | 6000 in / 1200 out | Exceeded → truncate, flag |
+| `unverified_coverage_floor` | profile | 0.65 | Below → `Unverified` |
+| `gate_mean_threshold` | profile | 75 | Release gate |
+| `gate_p10_threshold` | profile | 55 | Tail protection |
+| `waiver_max_days` | tenant | 30 | Enforced at creation |
+| `comment_delta_threshold` | project | 5 points | Suppress noisy comment updates |
+| `history_retention_days` | tenant | 730 | Evaluations |
+
+Configuration changes are audited events; changing a threshold mid-release requires an explicit `reason` field and appears in the release report's `policy_changes` array.
+
+---
+
+## 30. SLOs, error budgets, and incidents
+
+| SLO | Target | Error budget (30 d) |
+|---|---|---|
+| Webhook → field updated | 99% ≤ 15 s | 7.2 h |
+| Evaluation success (non-degraded) | 99.5% | 3.6 h |
+| Writeback delivered | 99.9% ≤ 15 min | 43 min |
+| Release report on time | 99% ≤ 10 min | 7.2 h |
+| Score stability (re-run identical) | 99.5% | 3.6 h |
+
+**Error-budget policy.** When 50% of a monthly budget is consumed: freeze prompt/model changes, require shadow evals for any rule change, and notify the owning team. At 100%: freeze non-critical rule changes and prioritise reliability work over new rubrics. This is deliberately blunt — score tools die from slow erosion of trust, not from one dramatic outage.
+
+| Severity | Definition | Page? | Response |
+|---|---|---|---|
+| SEV1 | Wrong scores written at scale, or writes to non-allowlisted fields | Yes | Freeze writes, roll back routing, incident channel |
+| SEV2 | Evaluation failures > 5%, or release gate unavailable | Yes | Degrade to deterministic, post status banner |
+| SEV3 | Single-tenant degradation, budget throttle | No | Ticket, next business day |
+| SEV4 | Cosmetic/UI | No | Backlog |
+
+**Degradation matrix** (what users see, not what operators know):
+
+| Condition | Issue badge | Release report | Writeback |
+|---|---|---|---|
+| LLM down, coverage OK | `Partial` | Warning banner | Yes, with `partial: true` |
+| LLM down, coverage < 0.65 | `Unverified` | Gate ineligible | Score only, no gate influence |
+| Jira read failing | `Stale` (last good + age) | Frozen watermark shown | No |
+| Jira write failing | Unchanged score + `sync lag` | Unaffected | Retried via outbox |
+
+---
+
+## 31. Data lifecycle, schema evolution, and migration
+
+**Rule DSL evolution.** Static predicates are versioned by DSL generation (`cel-v1`). A new generation supports both parsers for at least one release cycle; packs declare their generation, and the engine refuses to load an unknown one. This prevents the classic failure where a routine deploy silently reinterprets an old predicate.
+
+**Schema migrations.** Expand/contract only:
+
+1. Add nullable column / new table (deploy N).
+2. Dual-write and backfill in batches of 5k with throttling (deploy N).
+3. Switch reads behind a feature flag (deploy N+1).
+4. Drop the old path after two clean weeks (deploy N+2).
+
+Long-running backfills run as Temporal workflows and are pausable; they are labelled so a release scan cannot be starved by a backfill consuming the same queue.
+
+**Evaluation immutability.** Once written, an evaluation row never changes. Corrections are new rows; `superseded_by` links them. Release reports pin evaluation IDs, so re-running a gate never rewrites history.
+
+**Replay and backfill operations.**
+
+| Operation | Trigger | Guardrails |
+|---|---|---|
+| Re-evaluate one issue | Manual/API | Dedupe + single-writer |
+| Re-evaluate a release | Rule pack promotion | Read-only phase, then diff report |
+| Re-score a date range | Model rollback | Max 50k issues, rate-limited, resumable |
+| Recompute comments | Marker format change | Upsert only; never appends |
+| Delete tenant data | Offboarding | Soft delete 30 d, then hard delete + KMS key destruction |
+
+---
+
+## 32. Scale-out and sharding
+
+| Tier | Issues | Deployment |
+|---|---|---|
+| S | < 20k | single pod set, shared Postgres |
+| M | 20k–150k | API/worker split, read replica, monthly partitions |
+| L | > 150k, multi-site | shard by Jira site; one workflow namespace per shard |
+
+Sharding key is the **Jira site**, not the project: OAuth tokens, rate limits, and webhook secrets are all site-scoped, so co-locating by site removes cross-shard coordination entirely. Cross-site reporting is a nightly export into an analytics store, never an online join.
+
+**Backpressure ladder** (applied in order, automatically):
+
+1. Increase coalescing window 20 s → 60 s.
+2. Pause release scans (largest producer).
+3. Reduce semantic calls (drop to deterministic for lowest-priority projects).
+4. Shed manual evaluations with `429` + `Retry-After`.
+
+Each step is logged with the metric that triggered it, so capacity reviews have evidence rather than anecdotes.
+
+---
+
+## 33. Enablement and rollout playbook
+
+| Week | Activity | Exit criterion |
+|---|---|---|
+| 0 | Field map validation, rule pack draft, shadow mode | Config valid, 100% issues evaluated |
+| 1–2 | Shadow outputs reviewed by project leads | ≥ 80% findings judged valid |
+| 3 | Weights tuned once against human labels | Spearman ρ ≥ 0.7 on 100 issues |
+| 4 | Writes enabled for one pilot project | Zero duplicate comments over 1 week |
+| 5–6 | Release gate in advisory mode | Gate report matches manual QA judgement |
+| 7+ | Gate enforced; second project onboarded | Waivers used < 10% of failures |
+
+**Communication kit** (part of the product, not an afterthought): what the score means, what it does *not* mean, how to appeal a finding, who owns the rule pack, and the exact process for a waiver. Teams accept a strict score when the rules of the game are legible; they reject a mysterious one even when it is right.
+
+---
+
+## 34. Cost model and optimisation levers
+
+```
+cost_per_eval = (tokens_in·p_in + tokens_out·p_out) / cache_hit_ratio
+                + infra_amortised_per_eval
+```
+
+| Lever | Typical effect | Risk |
+|---|---|---|
+| Content-hash cache | −35–60% LLM calls | Stale prompts; mitigated by prompt hash in key |
+| Batched rubrics (1 call) | −4–6× call overhead | Larger prompts; capped by token ceiling |
+| Small model for extraction | −20–30% total tokens | Extraction errors; verified against verbatim text |
+| Truncation by field importance | −15% input tokens | Lost evidence; flagged `TRUNCATED` |
+| Nightly batch for release scans | −25% peak cost | Freshness up to 12 h (only for non-gating scans) |
+| Deterministic-first rules | −50% semantic rules needed | None; more code to maintain |
+
+**Anti-lever.** Never reduce cost by lowering output validation, dropping evidence checks, or skipping the grounding verifier. Those three are what make the score defensible; a cheap wrong score is more expensive than an expensive right one.
+
+---
+
+## 35. Benchmark and calibration methodology
+
+**Determinism test.** Re-evaluate the same snapshot 20 times at temperature 0. Requirement: ≥ 19/20 identical scores; any variance is attributed to provider nondeterminism and documented. If a model cannot meet this, it is not eligible for the judgement route.
+
+**Human agreement study.** 200 issues, stratified by project, type, and score band, labelled independently by two reviewers (Cohen's κ reported). Acceptance: ρ ≥ 0.75 against the mean human score, and no systematic bias > 5 points in any band (measured by Bland–Altman).
+
+**Rule discrimination.** For each rule, compute point-biserial correlation between pass/fail and the human "would you ship this?" label. Rules below 0.15 are candidates for weight reduction or removal — but removal is a human decision recorded in the pack changelog.
+
+**Latency budget.** p50 2.1 s, p95 6 s at 1.5k input tokens. A 30% regression blocks release; the offline harness records latency per prompt version so regressions are attributable.
+
+**Drift watch.** Weekly score-distribution comparison (KS test) on a fixed 1,000-issue sample. A shift with no corresponding product change triggers a prompt/model review before users notice.
+
+---
+
+## 36. Server, load balancer, and reverse proxy design
+
+This section defines the runtime topology that serves JRVS. It follows mainstream practice rather than bespoke infrastructure: stateless compute behind an L7 load balancer, an Envoy ingress for routing policy, and a controlled egress path for Jira and LLM traffic.
+
+### 36.1 Request path
+
+```mermaid
+flowchart LR
+    U["Clients: Jira, console, CI"] --> DNS["DNS / GeoDNS"]
+    DNS --> WAF["CDN + WAF + DDoS"]
+    WAF --> GLB["Global L7 LB<br/>latency + failover"]
+    GLB --> ALB["Regional ALB<br/>TLS 1.3, least-outstanding"]
+    ALB --> ING["Envoy ingress<br/>routes, retries, limits"]
+    ING --> API["API pods<br/>stateless"]
+    ING --> CON["Console (SSE)"]
+    API --> DB[("Postgres + replica")]
+    API --> RDS[("Redis")]
+    API --> Q[("Temporal / queue")]
+    Q --> WK["Worker pods"]
+    WK --> EG["Egress gateway<br/>static IPs, allowlist"]
+    EG --> JIRA["Jira Cloud"]
+    EG --> LLM["LLM provider"]
+```
+
+**Design rule:** nothing stateful sits behind the load balancer. Sessions, snapshots, and dedupe state live in Postgres/Redis, so any pod can serve any request and the LB never needs affinity.
+
+### 36.2 Server design
+
+| Concern | Decision |
+|---|---|
+| Process model | Gunicorn + Uvicorn workers, 1 worker per vCPU, `uvloop`, `--preload` for CoW memory savings |
+| Pod shape | 1 vCPU / 2 GiB request, 2 vCPU / 4 GiB limit; API and worker are separate Deployments |
+| Scaling signal | API: RPS + p95 latency; workers: Temporal task-queue backlog (not CPU) |
+| Startup | Readiness gate on config load + DB/Redis connect; `startupProbe` tolerates 60 s of migration waits |
+| Shutdown | SIGTERM → readiness false → `preStop` sleep 10 s → drain 45 s → finish in-flight (hard cap 25 s) → exit |
+| Timeouts | Client body read 30 s; request handling 90 s for gate-style routes; keep-alive 75 s |
+| DB access | asyncpg pool 10 per pod; PgBouncer in transaction mode beyond 20 API pods |
+| HTTP clients | Per-host connection pools, 100 max connections to Jira, 50 to the LLM gateway, 10 s connect timeout |
+| Security context | Non-root UID, read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, distroless base |
+| Supply chain | Signed images (cosign), SBOM attached, CVE scan gate at build, immutable tags |
+| Resilience | `PodDisruptionBudget` minAvailable 75%, anti-affinity across 3 AZs, topology spread by zone |
+| Config | ConfigMap for non-secrets; secrets via External Secrets → KMS; rotated without restart for Jira tokens |
+| Reliability hygiene | Liveness = process only (no dependency checks), readiness = dependency-aware, never the reverse |
+
+**Why liveness must not check dependencies.** A Jira outage would otherwise restart every pod, turning a partial degradation into a full outage. Liveness answers "is this process wedged"; readiness answers "should it receive traffic".
+
+### 36.3 Load balancer
+
+| Concern | Decision |
+|---|---|
+| Type | L7 ALB for HTTP/JSON; NLB only for raw TCP needs (none in JRVS v1) |
+| Algorithm | Least outstanding requests (not round robin) — LLM-backed routes have high variance |
+| Stickiness | Disabled; state is external |
+| Health check | `GET /readyz` every 10 s, timeout 3 s, healthy 2 / unhealthy 3, matcher 200 |
+| Idle timeout | 120 s, above the proxy keep-alive (75 s) to avoid mid-request resets |
+| TLS | Terminate at LB with ACM/Managed certs, TLS 1.3 preferred, 1.2 minimum, HSTS preload-eligible |
+| Backend protocol | HTTP/2 to targets where supported, HTTP/1.1 fallback |
+| Deregistration | 45 s delay to match drain window |
+| Slow start | 30 s for new targets (JIT and connection-pool warmup) |
+| Outlier ejection | Eject a target after 5 consecutive 5xx, 30 s base ejection, max 50% |
+| Retries | Idempotent methods only, max 2, with a 10% retry budget so retries cannot amplify an incident |
+| WAF | Managed OWASP rules + rate-based rules per IP and per tenant header; bot control on the console |
+| DDoS | Provider edge protection, connection limits, SYN flood mitigation |
+| Multi-region | GeoDNS/latency routing with health-based failover; each region is independently sufficient |
+
+**Retry discipline.** Blind retries are how a 5% error rate becomes a 100% outage. Retries are limited to idempotent calls, capped by a budget, and always jittered.
+
+### 36.4 Reverse proxy (Envoy)
+
+Envoy is chosen over a bare NGINX because routing policy, retries, circuit breaking, rate limiting, and mTLS are first-class and dynamically configurable. NGINX remains a supported alternative; the table notes equivalents.
+
+| Policy | Value | NGINX equivalent |
+|---|---|---|
+| Listeners | `:8080` h2c behind LB; `:8443` mTLS for east-west | `listen 8080;` |
+| Upstream keep-alive | 75 s, 1,024 max connections per host | `keepalive 64;` |
+| Per-route timeout | `/v1/issues/*/evaluate` 30 s, `/v1/releases/*/validate` 5 s (202), `/v1/gates/*` 95 s, default 15 s | `proxy_read_timeout` |
+| Per-try timeout | 10 s | `proxy_connect_timeout` |
+| Retries | `5xx,reset,connect-failure,refused-stream`, 2 attempts, 20%/min budget | `proxy_next_upstream` |
+| Circuit breaker | 2,048 connections, 1,024 pending, 2,048 requests, 3 retries | `limit_conn` |
+| Outlier detection | 5 consecutive 5xx → eject 30 s, max 50% | `max_fails`/`fail_timeout` |
+| Rate limit | Per `x-tenant-id` + per client IP, Redis-backed global limiter | `limit_req_zone` |
+| Request body | 1 MiB for JSON APIs; webhooks 2 MiB; attachments never proxied | `client_max_body_size` |
+| Response buffering | On for JSON, off for SSE | `proxy_buffering` |
+| Compression | Brotli/gzip for JSON > 1 KiB, never for SSE | `gzip` |
+| Headers | Strip inbound `X-Forwarded-*`, set canonical `X-Forwarded-For/Proto/Host`, inject `X-Request-Id`, propagate `traceparent` | `proxy_set_header` |
+| Security headers | HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, CSP for console | `add_header` |
+| Access logs | JSON: tenant, route, status, latency, upstream, retry count, request id | `log_format json` |
+| TLS (internal) | mTLS via SPIFFE identities, min TLS 1.3 for east-west | `ssl_verify_client` |
+
+**Route ownership.** Route configuration lives in Git and is validated in CI (`envoy --mode validate`), canaried on a single proxy instance, then rolled out. A malformed route should fail a build, never a production request.
+
+### 36.5 Egress control
+
+All outbound traffic — Jira, LLM, Slack — leaves through an egress gateway, never directly from application pods.
+
+| Concern | Decision |
+|---|---|
+| Static egress IPs | Per region, documented for tenant IP allowlisting |
+| Destination allowlist | FQDN allowlist (Jira tenant domains, LLM endpoints, Slack webhook host) |
+| Concurrency caps | Jira: 128 in-flight per site; LLM: 32 in-flight per provider |
+| Retry/backoff | Per-destination policy, `Retry-After` honoured, jittered exponential |
+| Circuit breaker | Per destination, 50% failure over 30 s opens for 60 s |
+| Audit | Every egress call logged with destination, bytes, status, tenant (no payload) |
+| LLM policy enforcement | Only the gateway's redacted payloads are permitted; egress blocks direct provider calls from app pods |
+
+### 36.6 Capacity and failure behaviour
+
+| Metric | Baseline | Headroom design |
+|---|---|---|
+| Sustained RPS | 300 | 3× via HPA (API) |
+| Burst RPS | 2,000 for 60 s | LB + ingress connection pools sized 4× |
+| Concurrent connections | 10k | 40k capacity |
+| TLS handshakes/s | 500 | 2k (session resumption tuned) |
+| Egress to Jira | 10 req/s per site | Token bucket, queueing, 429 backoff |
+| LLM calls | 20/s | 60/s with provider quota reservation |
+
+**Failure scenarios**
+
+| Scenario | Behaviour |
+|---|---|
+| Single AZ loss | LB shifts traffic in seconds; pods reschedule; no data loss (multi-AZ Postgres) |
+| Ingress misconfiguration | Canary proxy catches it; rollback is a config hash flip |
+| Retry storm | Retry budget exhausted → 503 with `Retry-After`; load shedding at ingress |
+| DB failover | API serves cached reads where safe, otherwise 503; workers retry via Temporal |
+| Jira outage | Egress breaker opens; writes queue in outbox; evaluations pause; gate reports freeze watermark |
+| Thundering herd on rule-pack promotion | Jittered enqueue + singleflight cache fill |
+
+### 36.7 Standards alignment
+
+| Area | Reference |
+|---|---|
+| Architecture | AWS Well-Architected (reliability, security pillars) |
+| SRE | Google SRE golden signals, error budgets, load shedding |
+| HTTP semantics | RFC 9110; `Forwarded` per RFC 7239 |
+| TLS | Mozilla Server Side TLS (intermediate), TLS 1.3 preferred |
+| Container security | Kubernetes Pod Security Standards (restricted), CIS benchmarks |
+| App security | OWASP ASVS L2, OWASP API Security Top 10 |
+| Supply chain | SLSA level 3 build provenance, Sigstore signing |
+
+### 36.8 Reference manifests (excerpt)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: jrvs-api }
+spec:
+  replicas: 6
+  strategy: { rollingUpdate: { maxSurge: 2, maxUnavailable: 0 } }
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: api
+          image: registry/jrvs@sha256:…
+          command: ["gunicorn","-k","uvicorn.workers.UvicornWorker","-w","4","app:app"]
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "2", memory: 4Gi }
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+```
+
+**HPA**
+
+```yaml
+metrics:
+  - type: Resource
+    resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+  - type: Pods
+    pods:
+      metric: { name: http_rps }
+      target: { type: AverageValue, value: "40" }
+behavior:
+  scaleUp:   { stabilizationWindowSeconds: 30 }
+  scaleDown: { stabilizationWindowSeconds: 300 }
+```
+
+---
+
 ## Appendix A — Glossary
 
 | Term | Definition |
