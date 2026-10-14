@@ -1001,6 +1001,595 @@ If both are adopted, OPTIMUS may optionally consume JRVS's published evaluation 
 
 ---
 
+## 27. Graph consistency and maintenance
+
+The graph is the product. If it drifts, every score above it is fiction. OPTIMUS therefore treats graph invariants as a first-class subsystem rather than an implicit assumption.
+
+### 27.1 Invariants
+
+| Invariant | Enforcement |
+|---|---|
+| One active edge per `(src, dst, kind)` | Partial unique index `WHERE state='active'` |
+| An active edge's endpoints exist and share a tenant | FK + tenant check on write; nightly audit |
+| Every `ac_id` belongs to a live requirement version | FK from AC items to version rows |
+| Every `TestRun` references an existing test case | FK + ingest-time validation |
+| Every `CoverageMap` references a known commit | Ingest-time check; unknown commits quarantined |
+| No self-edges, no edges across tenant boundaries | CHECK constraint + RLS |
+| A confirmed edge is never silently downgraded | Trigger appends `superseded_by`; state change audited |
+
+### 27.2 Eventual consistency window
+
+Ingestion is asynchronous by design. The system exposes where it is in time:
+
+- **Per-source watermark** (`jira`, `git`, `tcm`, `ci`) recorded on every evaluation.
+- **Graph freshness gauge** = `min(watermark across sources)`.
+- **Read-your-writes for humans**: after a manual confirmation, the API reads through to the writer for 5 seconds so the reviewer sees their own action immediately.
+- **Gate behaviour**: if any watermark is older than the policy limit (default 2 h), the gate returns `neutral` with `stale_inputs: true` rather than evaluating a graph it cannot vouch for.
+
+### 27.3 Reconciliation and repair
+
+A nightly job (and an on-demand one) runs four passes:
+
+1. **Referential sweep** — orphan edges, orphan test runs, edges to deleted artifacts. Auto-repair: mark `stale`, never hard-delete (audit).
+2. **Re-observation** — for edges with `origin=explicit`, verify the source still contains the key (commit message still there, TCM ref still present). Removed references retire the edge.
+3. **Source re-check** — compare local artifact maxima against source `updated_at`; enqueue targeted re-fetch for divergence.
+4. **Invariant audit** — sample 1% of the graph and assert invariants; any violation pages the owning team with the offending IDs.
+
+Repairs are logged as `graph_repairs` rows with before/after state, so a postmortem can distinguish "the model was wrong" from "the pipeline lost an event".
+
+### 27.4 Compaction
+
+Edges and versions are append-only, which trades disk for auditability. Compaction only ever merges **payloads**, never history:
+
+- Artifact versions older than 2 years collapse to `{content_hash, first_seen, last_seen}`.
+- Superseded edges older than 1 year collapse to their terminal state, retaining `origin`, `confidence`, and decision actor.
+- Diffs older than 90 days move to cold storage with the patch checksum retained locally.
+
+---
+
+## 28. Coverage and test-to-code mapping
+
+### 28.1 Coverage ingestion
+
+| Format | Produced by | Mapping extracted |
+|---|---|---|
+| LCOV | JS/TS, C/C++ | `SF:` source ↔ `TN:`/test-name blocks |
+| Cobertura XML | Python, Java | `<class filename>` ↔ `<package>`; test names absent, so file-level only |
+| JaCoCo XML | Java/Kotlin | `<sourcefile>` ↔ `<class>`; test names absent |
+| Istanbul JSON | JS/TS | `path` ↔ statement/branch maps |
+| OpenCover | .NET | file ↔ class/method |
+
+Normalization reduces all of them to `(commit_sha, test_path, source_paths[], line_hits)`.
+
+**Line-level requirement.** Only line-level maps feed the `code_test` dimension; file-level maps feed it at half weight and are flagged `CoarseMapping`. A file-level claim like "this module is covered" is too weak to justify a green gate on its own.
+
+### 28.2 Mapping fallbacks (when coverage is absent)
+
+| Order | Heuristic | Confidence |
+|---|---|---|
+| 1 | Coverage map (line-level) | 0.9 |
+| 2 | Explicit annotation (`@Jira`, `test('ABC-123 …')`) | 0.95 |
+| 3 | Test file naming ↔ source file naming (`export.spec.ts` ↔ `export.ts`) | 0.7 |
+| 4 | Import graph: test imports the module under test (static analysis, no execution) | 0.65 |
+| 5 | Directory ownership + component map | 0.4 |
+
+Fallback-derived links are `behavioural`/`structural`, never `explicit`, and their confidence is capped accordingly. The console surfaces which heuristic produced a link, because "covered by a test" means very different things at 0.9 and 0.4.
+
+### 28.3 Flaky tests
+
+```
+flaky if status changed ≥ 2 times in the last 10 runs on the same test_case_id
+```
+
+Flaky tests are:
+- excluded from the `execution` dimension numerator and denominator (so they neither pass nor fail a release),
+- flagged `FLAKY` on the linked requirement,
+- and **counted against confidence**, because a test that cannot be trusted is not evidence.
+
+This is the only honest handling: silently treating a flaky pass as proof is how a release ships broken, and treating a flaky failure as a blocker trains teams to ignore the gate.
+
+---
+
+## 29. Branching models
+
+### 29.1 Code change identity across branches
+
+The same logical change appears on `main`, a release branch, and possibly a backport branch. Treating them as three commits would triple-count coverage. OPTIMUS groups them by **patch-id**:
+
+```
+logical_change_id = patch_id(diff)         # git patch-id --stable
+branch_membership = [branch, branch, …]    # append-only
+```
+
+Edges attach to the logical change; branch membership is a set. A requirement is considered implemented on a release branch when its logical change is a member of that branch.
+
+### 29.2 Release, backport, and hotfix handling
+
+| Situation | Behaviour |
+|---|---|
+| Cherry-pick to release branch | Same `logical_change_id`; coverage evidence carries over; no duplicate finding |
+| Backport to older release | Edge is included in that release's scope only if the patch-id matches; otherwise flagged `BACKPORT_DIVERGED` |
+| Hotfix committed directly to release | Allowed, but requires an explicit requirement link; otherwise `ORPHAN_COMMIT` (major) |
+| Squash-merge | Patch-id computed on the squashed diff; PR body keys are the explicit reference |
+| Revert commit | Retires the implementation edge for the reverted logical change; requirement reverts to "not implemented" |
+
+`BACKPORT_DIVERGED` is advisory by default: divergent backports are often legitimate, but a silent divergence with no test is exactly how a fix ships untested to an older supported release.
+
+### 29.3 Scope of a PR gate versus a release gate
+
+| Aspect | PR gate | Release gate |
+|---|---|---|
+| Inputs | One PR's commits + touched components | All logical changes in the release branch |
+| Link trust | Prefers explicit; caches cold links for 60 s | Full recompute, snapshot graph |
+| Blocking | Only blocker rules scoped to the PR | Every policy rule |
+| False-negative tolerance | Low (developers iterate) | Lower (release is one-shot) |
+| Timeout behaviour | `neutral` at 90 s | Fail closed at the freshness limit |
+
+---
+
+## 30. Release scope resolution
+
+Scope is the most under-specified part of traceability tools, and the most common source of "the report is wrong".
+
+```
+resolve_scope(project, version):
+  issues      = jql("project = P AND fixVersion = V AND issuetype in (Story, Bug, Task)")
+  excluded    = issues where status in (Cancelled, Rejected) or labels contains "optimus-ignore"
+  branch      = release_branch_map[project][version]      # explicit config, not inferred
+  commits     = commits reachable from branch since previous release tag
+                or, if no tag, since release cutoff
+  logical     = group_by_patch_id(commits)
+  tests       = tests linked to issues OR to touched components
+  executions  = runs for tests on builds within the window
+  return Scope(issues, excluded, logical, tests, executions,
+               pf_scope_hash, generated_at)
+```
+
+Rules:
+- **fixVersion is authoritative** for issues; branch mapping is authoritative for code. Neither is inferred from the other.
+- **Exclusions are listed, never silent** — every cancelled issue appears in the report with a reason.
+- **`scope_hash`** (hash of IDs + versions) is stored on the report; two runs with the same hash must produce the same verdict.
+- **Late arrivals** (issues added after the run starts) are reported separately and require a re-run to affect the verdict.
+
+---
+
+## 31. Risk model and tunability
+
+Risk weighting exists so that "95% covered" cannot hide an untested payment path behind a well-covered help tooltip.
+
+```
+risk(ac_item) = clamp(
+    component_tier_weight      # T1=2.0, T2=1.0, T3=0.6
+  × change_size_factor         # 1 + min(1, changed_lines/500)
+  × defect_density_factor      # 1 + min(1, defects_12mo / 10)
+  , 0.5, 2.0)
+```
+
+| Parameter | Source | Owner | Change cadence |
+|---|---|---|---|
+| `component_tier_weight` | project config | Eng leadership | Quarterly |
+| `change_size_factor` | derived from diff | Automatic | Continuous |
+| `defect_density_factor` | issue history (bugs per component) | Derived from Jira | Monthly |
+| `clamp bounds` | policy | Platform | Rarely |
+
+Guardrails:
+- A component's tier cannot be changed within 14 days of a release gate that used it without an explicit `reason` and an audit entry.
+- Re-weighting triggers a recomputation of open evaluations and a badge `RISK_MODEL_CHANGED` on affected reports.
+- If risk weighting changes the verdict of a previously passing release, both verdicts are retained with their model versions.
+
+**Why bounded?** An unbounded risk weight lets one configuration mistake turn a single untested AC into a failed release. The clamp keeps the model opinionated but not catastrophic.
+
+---
+
+## 32. Query performance and caching
+
+### 32.1 Query shape
+
+| Access pattern | Strategy |
+|---|---|
+| `tests_for(requirement)` | Covering index `(src_id, kind, state)`; 1 hop |
+| `requirements_for(commit)` | Same index, reverse direction |
+| `stale_tests(release)` | Materialized view, refreshed on artifact version change |
+| `orphans(release)` | Anti-join; index on `(branch, artifact_id)` |
+| Graph explorer (depth ≤ 2) | Adjacency cache in Redis, 60 s TTL, per-tenant key |
+| Release dashboard | Precomputed summary table written at evaluation time |
+
+**No N+1 anywhere.** The console uses one batched query per screen; a graph view of 50 nodes costs three queries (nodes, edges, evidence), not 50.
+
+### 32.2 Cache hierarchy
+
+| Layer | TTL | Invalidation |
+|---|---|---|
+| HTTP (console) | 30 s | `ETag` from evaluation ID |
+| Gate link cache | 5 min | On commit/requirement version change for the repo |
+| Graph adjacency | 60 s | Version-keyed; new version = new key |
+| Link proposals | 30 min | Keyed by `(artifact_version_hash, ranker_version)` |
+| Evaluation results | Immutable | Never invalidated; new version creates a new row |
+| Coverage maps | 7 days | Keyed by commit SHA |
+
+Caching **immutable inputs** rather than mutable decisions is what makes the cache safe: a changed artifact gets a new hash, so the stale entry is unreachable rather than wrong.
+
+### 32.3 Query budgets
+
+Every user-facing query carries a budget; exceeding it degrades rather than hangs:
+
+| Surface | Budget | On exceed |
+|---|---|---|
+| Graph API | 800 ms | Truncate to depth 1 + `truncated: true` |
+| Review queue | 500 ms | Serve cached ranking + `stale_ranking: true` |
+| PR gate | 60 s | Link cache only, then `neutral` |
+| Release report | 8 min | Serve partial with `coverage_of_scope` |
+
+---
+
+## 33. Concurrency and idempotency
+
+Four writers touch the graph concurrently: connectors, link engine, drift detector, and humans. The rules:
+
+1. **Upsert by natural key.** `(src, dst, kind, active)` is unique; two workers proposing the same edge converge to one row via `INSERT … ON CONFLICT DO UPDATE SET confidence = GREATEST(...)`.
+2. **Human decisions win races.** A confirmation writes `state='active', origin='confirmed'` with a decision row in the same transaction. A concurrent model proposal for the same pair is ignored, not merged.
+3. **Edge changes are append-only.** State transitions write a new row and set `superseded_by` on the old one; readers use the `active` view.
+4. **Evaluation snapshot isolation.** An evaluation reads a consistent snapshot (`inputs_hash`), so a concurrent edge confirmation either makes it into the run or the next one — never halfway.
+5. **Gate idempotency.** Key = `(repo, pr_id, head_sha)`. Re-running produces the same check result; provider-side duplicate check runs are deduplicated by name+sha.
+6. **Temporal workflow identity.** `workflow_id = f"{kind}:{artifact}:{version_hash}"`, so duplicate triggers attach rather than fork.
+
+```mermaid
+stateDiagram-v2
+    [*] --> proposed
+    proposed --> active: auto_accept
+    proposed --> active: human_confirm
+    proposed --> rejected: human_reject
+    proposed --> discarded: low_confidence
+    active --> stale: not_reobserved_90d
+    active --> superseded: conflicting_explicit
+    stale --> active: reobserved
+    stale --> retired: decay_below_0.5
+    rejected --> [*]
+    retired --> [*]
+```
+
+A `proposed` edge is never used for a gate. The state machine is enforced in the write layer, not the UI, so a bypassing client cannot create a fact.
+
+---
+
+## 34. Embedding and model lifecycle
+
+| Artifact | Versioned field | Why |
+|---|---|---|
+| Embedding model | `embedding_model_version` on every vector row | Mixing spaces silently destroys similarity |
+| Re-ranker | `ranker_version` on every candidate | Reproducible proposals and audits |
+| Drift classifier | `classifier_version` on every change record | Reproducible L0/L1/L2 and re-runs |
+| Policy | `policy_version` on every evaluation | Reproducible verdicts |
+
+**Re-embedding migration** (inevitable, plan for it):
+
+1. Add new vector column/table with the new model version; dual-write on ingest.
+2. Backfill historical artifacts in priority order (open requirements and active tests first), rate-limited.
+3. Run candidate generation against both spaces on a 1,000-pair sample; compare recall.
+4. Switch reads behind a flag; keep the old column for one release cycle.
+5. Drop old vectors, rebuild the ANN index, record the switch in the changelog.
+
+**Model promotion gates.** A new ranker or classifier ships only if, on the frozen eval set: precision at auto-accept does not drop, recall at 0.55 does not drop >2 points, and the L2 false-positive rate does not rise >2 points. Promotion is per-install, not global: one tenant's data should not silently change another's behaviour.
+
+**Embedding drift watch.** Track the distribution of cosine similarity for confirmed versus rejected pairs monthly. A widening gap means the model is becoming more decisive (usually fine); a narrowing gap means it is losing signal (raise the threshold, then retrain).
+
+---
+
+## 35. Multi-tenancy, residency, and scale-out
+
+| Concern | Design |
+|---|---|
+| Isolation | `tenant_id` on every row + Postgres RLS + per-tenant KMS key |
+| Residency | Tenant pinned to a region; connectors, queues, and object stores are regional |
+| Noisy neighbour | Per-tenant quotas on ingest rate, link proposals, and gate concurrency |
+| Large tenants | Cell-based: tenants above 3k repos get a dedicated worker pool and Postgres schema |
+| Cross-tenant learning | Only aggregate, k-anonymised feature statistics; never raw artifact content |
+| Deletion | Soft delete 30 d → hard delete + object-store purge + embedding tombstones |
+
+**Cells, not one big cluster.** A single global queue makes one tenant's bulk import everyone's latency problem. Cells (tenant groups of similar size) bound the blast radius and make capacity planning tractable.
+
+---
+
+## 36. SLOs, error budgets, incidents
+
+| SLO | Target | Budget (30 d) |
+|---|---|---|
+| PR gate p95 | ≤ 60 s | 1% over |
+| PR gate availability | 99.9% | 43 min |
+| Ingestion lag p95 | ≤ 45 s | 1% over |
+| Release report on time | 99% ≤ 8 min | 7.2 h |
+| Auto-accept precision (audited) | ≥ 0.95 | 0 weeks below 0.92 |
+
+**Degradation matrix**
+
+| Condition | PR gate | Release gate | Console |
+|---|---|---|---|
+| Source stale > 2 h | `neutral` + `stale_inputs` | `FAIL_CLOSED_NEUTRAL` | Banner with watermark |
+| Link service down | Cached edges only | `neutral` | Links read-only |
+| Ranker rolled back | Normal | Normal + `ranker_changed` badge | Badge on affected links |
+| Coverage missing | Skipped check | `code_test` unknown | Dimension greyed |
+
+**Incident severities**
+
+| Sev | Example | Response |
+|---|---|---|
+| SEV1 | False pass at scale / gates blocking all PRs | Freeze auto-accept, disable gate, rollback, incident channel |
+| SEV2 | Gate latency > 5 min, precision < 0.90 | Raise threshold to 0.92, page owner |
+| SEV3 | One connector down | Serve cache, ticket |
+| SEV4 | Console cosmetic | Backlog |
+
+The gate kill switch is a per-project flag, not a redeploy. When a validation tool is wrong, the fastest correct action is to stop asserting, not to argue.
+
+---
+
+## 37. Configuration reference
+
+| Key | Scope | Default | Notes |
+|---|---|---|---|
+| `policy_mode` | project | `shadow` | `shadow` / `advisory` / `gating` |
+| `auto_accept_threshold` | tenant/project | 0.85 | Remote-tunable during incidents |
+| `review_threshold` | project | 0.55 | Below → discard |
+| `min_independent_signals` | tenant | 2 | Guards auto-accept |
+| `gate_timeout_s` | tenant | 90 | Hard cap |
+| `freshness_limit_h` | project | 2 | Gate goes neutral beyond |
+| `confidence_floor` | project | 0.80 | Link confidence mass needed to pass |
+| `coverage_min` | project | 0.90 | Risk-weighted AC coverage |
+| `waiver_max_days` | tenant | 30 | Enforced at creation |
+| `flaky_window_runs` | project | 10 | Flaky detection window |
+| `backfill_days` | repo | 90 | Onboarding history depth |
+| `no_code_egress` | tenant | false | Disables all code-derived prompts |
+| `risk_model_version` | project | `v1` | Pinned per evaluation |
+
+Every change is an audited event; gate-affecting changes require a reason and appear in the next report's `config_changes`.
+
+---
+
+## 38. Ranker training data and bias controls
+
+The ranker learns from human decisions, and human decisions are not a random sample — reviewers only see links the model was unsure about. Training naively on that data teaches the model to agree with itself.
+
+**Mitigations**
+
+| Bias | Mitigation |
+|---|---|
+| Selection bias (only ambiguous links reviewed) | Weekly random audit of 200 auto-accepted links, labelled and added as positives/negatives |
+| Popularity bias (busy components reviewed more) | Stratified sampling by component and repo in the audit set |
+| Label leakage over time | Split by time; never train on future decisions |
+| Repo leakage | Evaluate on held-out repos, not held-out pairs from the same repo |
+| Reviewer disagreement | Two-reviewer sample monthly; κ < 0.6 triggers rubric clarification before retraining |
+| Sycophancy to ranker | Blind review: confidence hidden until decision is recorded |
+
+**Metrics.** Precision@auto-accept (primary), recall@0.55 (secondary), NDCG@10 on the review queue (usability), and calibration error (ECE) so the displayed confidence means what it says.
+
+**Retraining cadence.** Weekly once ≥500 new decisions exist; otherwise on demand. Every model is shadow-scored for one week before promotion, and the previous two versions remain loadable for rollback.
+
+---
+
+## 39. Onboarding playbook
+
+| Day | Step | Artifact produced |
+|---|---|---|
+| 0 | Connect Jira, Git, TCM, CI with read-only tokens | Connector health check |
+| 1 | Map repos ↔ Jira projects, suites ↔ components | `project_map` config |
+| 2 | Bootstrap component map from CODEOWNERS | `component_map` draft, human-reviewed |
+| 3 | Backfill 90 days of history (quota-bounded) | Initial graph |
+| 4 | Run link discovery; audit 100 random links | Precision baseline |
+| 5 | Review queue triage with the team | Labelled decisions |
+| 6–7 | Policy draft in shadow mode | First advisory report |
+| 14 | Precision ≥ 0.95, queue < 24 h | Enable PR check (advisory) |
+| 30 | Two clean releases | Enable gating for pilot repos |
+
+**Failure to onboard** usually comes from one of three causes, each with a known remedy: no keys in commit messages (start with structural + semantic, agree a key convention), no coverage instrumentation (fallback heuristics, plan instrumentation), or an unmapped component map (ship the CODEOWNERS-derived draft and review it, rather than blocking).
+
+---
+
+## 40. Benchmark and evaluation methodology
+
+| Benchmark | Method | Pass criteria |
+|---|---|---|
+| Line linking | Labelled pairs from human decisions | Precision ≥ 0.95 at auto-accept |
+| Drift classification | L0/L1/L2 labelled corpus (600 items) | L2 precision ≥ 0.90, recall ≥ 0.85 |
+| Graph determinism | Replay a fixed event stream twice | Identical graph hash |
+| Report reproducibility | Re-run a release from its `inputs_hash` | Byte-identical report |
+| Gate latency | Replay 500 real PRs | p95 ≤ 60 s |
+| Ingestion throughput | 10× normal commit rate for 10 min | Lag p95 ≤ 45 s |
+| Consistency | Kill consumers mid-stream, restart | No duplicate edges, no lost events |
+
+**Graph hash** = deterministic hash of (artifact IDs + active edges + versions) in scope. It is the cheapest possible regression detector: if a refactor changes the graph, the hash changes, and the diff explains why.
+
+---
+
+## 41. Cost model
+
+```
+daily_cost = embedding_calls        × p_embed
+           + rerank_pairs           × p_rerank
+           + classification_calls   × p_llm
+           + storage_gb             × p_gb_month / 30
+           + execution_rows_written × p_row
+```
+
+| Lever | Effect | Guardrail |
+|---|---|---|
+| Candidate cap (top 50 per artifact) | Linear, not quadratic, cost | Recall monitored monthly |
+| Embedding reuse by content hash | −30–70% embedding calls | Hash includes model version |
+| Incremental recompute (depth ≤ 2) | Avoids full scans | Full scan weekly as a safety net |
+| Batch classification of AC diffs | −40% classification calls | Batch size ≤ 20, structured output |
+| Cold storage for diffs | −60% object-store cost | 90-day hot window |
+| Sampling for duplicate scan | Bounded | Never sample gate-critical rules |
+
+**Anti-lever.** Do not cut cost by raising the auto-accept threshold (hides links), skipping the audit (hides errors), or dropping drift classification (hides stale tests). Each of those converts a cost saving into a silent correctness failure, which is the only failure this product cannot survive.
+
+---
+
+## 42. Server, load balancer, and reverse proxy design
+
+OPTIMUS has three traffic classes with different shapes: **synchronous gate/console APIs** (latency-critical), **webhook ingestion** (bursty, must never drop), and **internal event/stream traffic** (throughput-critical). The topology below serves all three without letting any one starve the others.
+
+### 42.1 Request and event path
+
+```mermaid
+flowchart LR
+    GH["Git provider"] --> WAF["Edge WAF + DDoS"]
+    JI["Jira"] --> WAF
+    TC["TCM"] --> WAF
+    WAF --> ALB["Regional ALB<br/>HTTP/2, TLS 1.3"]
+    ALB --> ING["Envoy ingress<br/>webhooks 2MiB, APIs 1MiB"]
+    ING --> API["Stateless API pods"]
+    ING --> GATE["Gate pods<br/>isolated pool, 90s budget"]
+    API --> PG[("Postgres + pgvector")]
+    API --> RD[("Redis")]
+    API --> KAFKA[("Kafka / NLB"])
+    KAFKA --> INGEST["Ingestion workers"]
+    INGEST --> LINK["Link workers"]
+    LINK --> POL["Policy workers"]
+    POL --> GATE
+    API --> S3[("Object store<br/>presigned, off-proxy")]
+    INGEST -. egress .-> EG["Egress gateway<br/>static IPs + allowlist"]
+    EG -.-> GH
+    EG -.-> JI
+    EG -.-> TC
+```
+
+**Payload rule:** diffs, JUnit XML, and coverage files never travel through the proxy. Connectors write them to object storage directly and pass a reference in the event. The proxy only sees small JSON.
+
+### 42.2 Server design
+
+| Concern | Decision |
+|---|---|
+| Services | `api`, `gate`, `connector`, `link-worker`, `policy-worker` — separate Deployments, separate scaling signals |
+| Gate isolation | Dedicated pod pool with reserved CPU; a release scan backlog must not slow a PR check |
+| Pod shape | API 1 vCPU/2 GiB; link worker 2 vCPU/6 GiB (embeddings); gate 1 vCPU/2 GiB |
+| Scaling | API: RPS + p95; gate: concurrent checks; workers: Kafka consumer lag / Temporal backlog |
+| Kafka consumers | One consumer group per stage; partition count sized to peak parallelism (48), not to average |
+| Shutdown | Consumers commit offsets then stop fetching; in-flight batches finish; 60 s grace |
+| DB access | PgBouncer transaction pooling; link workers use a separate pool (long queries) |
+| Embedding compute | Batched (32–128 items), cached by content hash, rate-limited per tenant |
+| Security context | Non-root, read-only FS, dropped capabilities, seccomp, distroless base, signed images |
+| Isolation | Noisy-tenant limits on ingest rate, link proposals, and gate concurrency |
+| Mesh | mTLS east-west with SPIFFE identities; authorization policy per service pair |
+
+**Consumer lag is the autoscaling signal, not CPU.** Link workers spend most of their time waiting on the embedding service and Postgres; CPU-based HPA both under- and over-scales them.
+
+### 42.3 Load balancer
+
+| Concern | Decision |
+|---|---|
+| HTTP | L7 ALB, least outstanding requests, cross-zone enabled |
+| Kafka / gRPC | NLB (TCP), one target group per broker, client-side partition assignment |
+| Health check | Gate: `/readyz` (DB + ranker loaded) every 5 s; ingress: every 10 s |
+| Idle timeout | 180 s for webhook ingestion (slow sources), 120 s for APIs |
+| TLS | Terminated at ALB, TLS 1.3 preferred, HSTS; internal mTLS for service-to-service |
+| Deregistration | 30 s; gate requests are ≤ 90 s and must not be cut mid-flight |
+| Slow start | 20 s for gate pods after deploy (ranker warm-up) |
+| Outlier ejection | 5 consecutive 5xx → eject 60 s; max 30% (avoid mass ejection during a shared dependency failure) |
+| Retries | Idempotent only; webhooks receive `2xx` before processing (async), so the LB never retries work |
+| WAF | Managed OWASP + payload size rules + per-IP rate limits on webhook paths |
+| DDoS | Edge protection; connection caps; SYN cookies |
+
+**Webhook acknowledgment contract.** The gateway validates signature and size, writes the raw event to Kafka, and returns `202` within 100 ms. Slow downstream work happens asynchronously. This is what makes a 10× event burst a throughput problem instead of a data-loss problem.
+
+### 42.4 Reverse proxy (Envoy)
+
+| Policy | Value |
+|---|---|
+| Route: `POST /v1/gates/pr` | 95 s timeout, per-try 30 s, no retries on POST, circuit breaker 512 concurrent |
+| Route: `POST /v1/hooks/*` | 2 s timeout, 2 MiB body, 4,000 rps per tenant burst, 500 rps sustained |
+| Route: `GET /v1/evaluations/*` | 10 s timeout, 1 MiB, cached 30 s via `ETag` |
+| Route: `GET /v1/events` (SSE) | buffering off, 30 min idle, no compression |
+| Route: console static | CDN-backed, 1 h cache, immutable asset hashes |
+| Upstream pools | keep-alive 60 s, 2,048 connections per host, 1,024 pending |
+| Retries | `connect-failure,reset,refused-stream` only; budget 10%/min |
+| Outlier detection | 5xx ejection, 60 s base, max 30% |
+| Header hygiene | Strip client `X-Forwarded-*`, inject canonical values, `X-Request-Id`, `traceparent` |
+| Security headers | HSTS, `nosniff`, CSP, `Referrer-Policy`, `Permissions-Policy` |
+| Access logs | JSON with tenant, route, status, latency, upstream, bytes, request id |
+| Limits | Per-tenant token bucket (Redis-backed) so one bulk import cannot consume the gate's capacity |
+
+**Why per-route timeouts matter here.** A 95-second gate route and a 2-second webhook route sharing a default 60-second proxy timeout would either drop legitimate gates or let a stalled webhook hold a worker. Route-level budgets make the SLOs enforceable.
+
+### 42.5 Egress control
+
+| Destination | Policy |
+|---|---|
+| Jira | Static egress IPs, 10 req/s per site, 429 backoff, per-tenant concurrency 8 |
+| Git provider | 5,000 req/h per installation, conditional requests (`ETag`) to stay under quota |
+| TCM | 120 req/min, delta polling with `updated_at` cursors |
+| LLM / embeddings | 32 in-flight, payload redaction enforced upstream, no source code (policy-checked at the gateway) |
+| Object store | Private endpoint, no public egress |
+
+The egress gateway enforces the **no-code-egress** mode centrally: when a tenant enables it, the gateway rejects any request containing a `code_context` marker, so a well-meaning service change cannot leak source by accident.
+
+### 42.6 Capacity and failure behaviour
+
+| Metric | Baseline | Headroom |
+|---|---|---|
+| PR checks | 8k/day, 12 concurrent peak | 60 concurrent |
+| Webhook events | 23k/day, 500/s burst | 2,000/s for 60 s |
+| Link proposals | 50k/day | 400k/day |
+| Release evaluations | 4/day | 20/day |
+| Kafka retention | 30 days | Replay from cold storage 90 days |
+| Postgres edges | 8M | 50M with partitioning by tenant bucket |
+
+**Failure scenarios**
+
+| Scenario | Behaviour |
+|---|---|
+| Kafka broker loss | Producer retries with idempotent writes; NLB shifts; no duplicate artifacts (content-hash upsert) |
+| Gate pool saturation | Admission control returns `neutral` with `overloaded: true` instead of timing out silently |
+| Embedding provider down | Link engine falls back to explicit + structural only; confidence drops; gates still evaluate |
+| Webhook storm | Edge rate limit per IP + tenant, queue absorbs burst, 429 only beyond 4,000 rps |
+| Postgres failover | Writes pause; reads served from replica; gate degrades to cached graph + `neutral` if stale |
+| Proxy config error | Config validated in CI and canaried; rollback by config hash |
+
+### 42.7 Standards alignment
+
+| Area | Reference |
+|---|---|
+| Architecture | AWS Well-Architected; cell-based isolation for noisy tenants |
+| Eventing | CloudEvents 1.0 envelope, at-least-once + idempotent consumers |
+| HTTP semantics | RFC 9110; `Retry-After` honoured everywhere |
+| TLS | Mozilla intermediate profile, TLS 1.3 preferred, mTLS internally |
+| Containers | Pod Security Standards restricted, CIS benchmarks |
+| App security | OWASP ASVS L2, OWASP API Top 10 |
+| Supply chain | SLSA 3 provenance, Sigstore signing, SBOM |
+| Observability | OpenTelemetry traces/metrics/logs, W3C `traceparent` |
+
+### 42.8 Reference configuration (excerpt)
+
+```yaml
+# Envoy route excerpt
+routes:
+  - match: { prefix: "/v1/gates/" }
+    route:
+      cluster: gate_service
+      timeout: 95s
+      retry_policy:
+        retry_on: "connect-failure,reset,refused-stream"
+        num_retries: 1
+        per_try_timeout: 45s
+      hedge_policy: { })
+  - match: { prefix: "/v1/hooks/" }
+    route:
+      cluster: ingest_service
+      timeout: 2s
+      max_stream_duration: { max_stream_duration: 2s }
+```
+
+```yaml
+# Worker HPA on consumer lag
+metrics:
+  - type: External
+    external:
+      metric: { name: kafka_consumergroup_lag }
+      target: { type: AverageValue, value: "5000" }
+behavior:
+  scaleUp:   { stabilizationWindowSeconds: 60,  policies: [{ type: Percent, value: 100, periodSeconds: 60 }] }
+  scaleDown: { stabilizationWindowSeconds: 600, policies: [{ type: Percent, value: 25,  periodSeconds: 120 }] }
+```
+
+---
+
 ## Appendix A — Glossary
 
 | Term | Definition |
