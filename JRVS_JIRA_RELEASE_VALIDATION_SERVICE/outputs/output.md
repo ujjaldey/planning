@@ -1499,6 +1499,81 @@ behavior:
 
 ---
 
+## 37. Assumption register
+
+The assumptions in §23 are the headline list. This register is the working version: every assumption is written so it can be **tested**, assigned an owner, and invalidated on evidence rather than opinion.
+
+### 37.1 Product and usage
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| A1 | Tenants run **Jira Cloud**; Server/Data Center is out of scope for v1 | Connector rewrite (REST v2, different webhooks, no ADF) — 6–8 weeks | Tenant inventory at contract time |
+| A2 | A visible numeric score on the ticket is acceptable to teams | Need role-scoped fields + separate manager view; complicates write-back | Objection rate during pilot; field-level visibility requests |
+| A3 | Rule packs are **human-owned**; JRVS never invents policy | Governance model collapses; scores become unarguable | % of packs edited by non-owners; appeal volume |
+| A4 | One Jira site per tenant | Sharding key breaks; cross-site reporting needed | Installation survey |
+| A5 | Release gating is wanted, not just advisory | Build only reports; waivers and gates unused | Gate adoption rate after advisory phase |
+
+### 37.2 Data
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| A6 | Ticket text carries enough signal for semantic judgement | `unknown` rate rises; scores become deterministic-only | `evaluation_unknown_rate` > 20% |
+| A7 | Acceptance criteria can be split into discrete items | Coverage and testability scores mislead; parser falls back to prose | % issues where AC count = 1 and text > 400 chars |
+| A8 | Content is English-primary | Lower semantic confidence; multilingual packs needed | Language detection distribution |
+| A9 | Attachments are not required to judge quality | Rule set incomplete for image-heavy bug reports | % bugs with only screenshot evidence |
+| A10 | ADF→text normalization is deterministic and lossless for text | Content hashes unstable → cache misses and duplicate write-backs | Hash stability test in CI |
+
+### 37.3 Technical
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| A11 | The chosen provider offers reliable structured output at temperature 0 | Determinism and schema guarantees weaken; more `unknown` | 20-run determinism benchmark |
+| A12 | Jira allows ~10 req/s per app installation | Capacity model halves; sharding needed earlier | `429` rate at steady state |
+| A13 | Projects can create/supply a field map and edit permissions | Writes blocked; value limited to a report | Onboarding config validation pass rate |
+| A14 | Typical issue fits within 2,500 semantic input tokens | Truncation increases; semantic coverage drops | Token distribution p95 |
+| A15 | Postgres + monthly partitions handle 150k issues × 2 years | Partition/archival redesign required | Table size projections at 6 months |
+
+### 37.4 Operational and organisational
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| A16 | Someone spends ~30 min/week per project calibrating weights | Drift goes unnoticed; trust erodes slowly | Calibration sessions actually held |
+| A17 | A team exists to own SEV1/SEV2 | Incidents handled ad hoc; write-backs stay frozen too long | On-call rota exists before GA |
+| A18 | Waivers stay exceptional (< 10% of failures) | Gate becomes theatre; policy is effectively unenforced | Waiver-to-failure ratio |
+| A19 | Scores are **not** used for performance management | Gaming and resentment; ethical and legal exposure | HR/people-policy commitment in writing |
+| A20 | Teams can adopt within 4–6 weeks | Long tail of stalled pilots; support cost balloons | Time-to-first-write per project |
+
+### 37.5 Security and compliance
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| A21 | Sending redacted ticket text to an external LLM is permitted | Must self-host a model; cost and latency change materially | Security review sign-off per tenant |
+| A22 | 400-day LLM audit retention is acceptable | Shorter retention weakens reproducibility claims | Privacy review |
+| A23 | Tickets contain little regulated data; redaction is defence in depth | Field-level encryption and stricter DLP required | PII scan of snapshot corpus |
+
+### 37.6 Review triggers
+
+Revisit the register — and the design — when any of these fire:
+
+- `evaluation_unknown_rate` > 20% for two consecutive weeks → A6, A11
+- Waiver rate > 15% of failures → A18, A3
+- Human agreement ρ < 0.70 at quarterly calibration → A3, A19
+- Onboarding time > 2 weeks for two consecutive tenants → A13, A20
+- `429` rate > 1% of Jira calls → A12
+- Any tenant requiring self-hosted inference → A21
+
+### 37.7 Invalidation playbook
+
+1. **Name the broken assumption** in the register and link the evidence.
+2. **Quantify the blast radius**: which scores, reports, and gates used the assumption.
+3. **Choose**: adapt (config), extend (engineering), or explicitly accept the limitation (documented).
+4. **Record the decision** as an ADR and update §22 if the architecture changes.
+5. **Re-run the affected evaluations** if the change alters scoring inputs; keep old reports pinned.
+
+Assumptions are not risks to be wished away. They are the load-bearing walls of the design, and this register exists so that when one cracks, the team notices before a release does.
+
+---
+
 ## Appendix A — Glossary
 
 | Term | Definition |
