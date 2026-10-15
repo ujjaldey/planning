@@ -1590,6 +1590,83 @@ behavior:
 
 ---
 
+## 43. Assumption register
+
+§25 lists the headline assumptions. This register makes them testable: each has an owner, a signal that would falsify it, and a defined response when it does.
+
+### 43.1 Product and usage
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| B1 | Most work carries a **Jira key** in commit messages or PR metadata (≥ 70% of commits) | Explicit links shrink; structural + semantic must carry the load; precision risk rises | `explicit_link_coverage` per repo |
+| B2 | Teams want traceability gating, not just reporting | Build advisory-only; gates unused | PR check adoption after advisory phase |
+| B3 | A release maps cleanly to a `fixVersion` **and** one release branch | Scope resolution needs per-project overrides; reports disagree | % releases with ambiguous mapping |
+| B4 | Test cases live in a TCM, not only as code tests | Coverage/test-name mapping becomes primary; TCM connector shelved | TCM presence per project |
+| B5 | One TCM per tenant | Multi-TCM normalization needed; IDs collide | Installation survey |
+
+### 43.2 Data
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| B6 | Acceptance criteria are enumerable, discrete items | AC-level coverage and drift degrade to ticket-level | % issues where parser yields 1 item for multi-paragraph text |
+| B7 | Test steps are textual and stable enough for embeddings | Semantic linking weakens; structural/behavioural dominate | Similarity distribution drift |
+| B8 | Behavioural requirement changes are incremental, not wholesale rewrites | L2 classification noise; drift findings become unusable | % requirement versions with > 60% AC churn |
+| B9 | Coverage instrumentation is available for Tier-1 components | `code_test` dimension unavailable; gates rely on weaker evidence | Coverage ingest rate per repo |
+| B10 | 90 days of history is enough for cold-start linking | Longer backfill cost; on-time precision lower | Onboarding precision at day 4 |
+| B11 | `patch-id` reliably groups cherry-picks | Duplicate logical changes triple-count coverage | Patch-id collision audit |
+
+### 43.3 Technical
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| B12 | Webhooks arrive out of order but are replayable | Duplicate/lost edges; need stronger ordering guarantees | Duplicate event rate |
+| B13 | Postgres + pgvector handles ~50M edges and ~5M vectors | Dedicated graph/vector store required; interface already abstracts it | p95 query latency at 10M edges |
+| B14 | LLM classification (L0/L1/L2) is sufficient without source code egress | No-egress mode becomes default; classification quality drops slightly | Classifier F1 in no-egress mode |
+| B15 | Reviewers generate ≥ 500 labelled decisions per project in 8 weeks | Per-project rankers never train; global ranker used longer | Decisions/week at pilot |
+| B16 | Gate can complete within 90 s on warm links | More `neutral` outcomes; developers lose patience | `gate_latency_p95`, `gate_neutral_rate` |
+| B17 | Kafka (or Redis Streams) sustains 500 events/s burst per tenant | Need sharding by source or stronger backpressure | Consumer lag under load test |
+
+### 43.4 Operational and organisational
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| B18 | Reviewers can spend 10–20 decisions/day during pilots | Queue backlog; proposals expire unconfirmed | Median queue wait |
+| B19 | Someone owns the component map and policy per project | Mapping rots; linkage quality silently decays | Map review dates |
+| B20 | Release cadence is at least monthly | Freshness windows mis-tuned; drift noise rises | Releases per quarter |
+| B21 | Teams accept AC-level findings rather than ticket-level | Findings feel noisy; adoption drops | Dismissal rate by granularity |
+| B22 | QA leads, not platform, own test-case semantics | Policy conflicts; unclear escalation | Named policy owner per project |
+
+### 43.5 Security and compliance
+
+| ID | Assumption | If wrong | Validation signal |
+|---|---|---|---|
+| B23 | Read-only tokens are obtainable for Jira, Git, TCM, CI | Write-back pressure increases; connector scope changes | Token scope audit |
+| B24 | Source code can stay in-VPC and only signatures/docstrings leave | Full no-egress mode required; semantic code linking disabled | Tenant security review |
+| B25 | Repo ACLs map to platform identity for result visibility | Coarser visibility model; possible over-exposure | ACL sync coverage |
+| B26 | Diffs and test reports may be stored for 90 days | Shorter retention weakens reproducibility | Retention policy sign-off |
+
+### 43.6 Review triggers
+
+- `auto_accept_precision` lower CI bound < 0.92 for two weeks → B1, B7, B15
+- Review queue median wait > 48 h → B18
+- `explicit_link_coverage` < 50% in a repo → B1
+- `gate_neutral_rate` > 5% → B12, B16
+- Onboarding precision < 0.90 at day 30 → B10, B13
+- Tier-1 repo without coverage ingest → B9
+- Any tenant mandating no-code-egress → B14, B24
+
+### 43.7 Invalidation playbook
+
+1. **Record the falsification** in the register with the metric and date.
+2. **Classify the impact**: link quality, score correctness, gate behaviour, or adoption.
+3. **Pick a response**: reconfigure, extend the pipeline, or accept and document.
+4. **Re-run affected evaluations** from pinned `inputs_hash` values if scoring inputs changed.
+5. **Update policy and ADRs**; keep prior reports immutable and explicitly labelled with the model versions they used.
+
+The register is reviewed at every release retrospective and whenever a trigger fires. An assumption that is never tested is a guess; this document exists to keep the guesses visible.
+
+---
+
 ## Appendix A — Glossary
 
 | Term | Definition |
